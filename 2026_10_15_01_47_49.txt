@@ -1,0 +1,10 @@
+Language: c
+Lab0: 6/7
+Lab1: 0/6
+Lab2: 0/5
+Lab3: 0/6
+Lab4: 0/5
+Lab5: 0/4
+Lab6: 0/8
+Lab7: 0/6
+Lab8: 0/4
