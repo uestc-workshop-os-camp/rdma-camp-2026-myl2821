@@ -73,12 +73,11 @@ r101_result r101_destroy_engine(r101_engine *engine) {
     if (!engine)
         return R101_INVALID;
 
-    for (int i = 0; i < MAX_BUFFERS; i++) {
-        /* Release the engine's resources after stopping worker and device accesses. */
-        if (engine->lbm[i].mr) {
-            ibv_dereg_mr(engine->lbm[i].mr);
-            engine->lbm[i].mr = NULL;
-        }
+    r101_local_buffer_metadata *lbm, *tmp;
+    HASH_ITER(hh, engine->lbms, lbm, tmp) {
+        ibv_dereg_mr(lbm->mr);
+        HASH_DEL(engine->lbms, lbm);
+        free(lbm);
     }
 
     if (engine->pd != NULL) {
@@ -112,30 +111,23 @@ r101_result r101_register_local_memory(r101_engine *engine,
         return R101_INVALID;
     /* Register application memory and export its handle and stable metadata. */
 
-    if (posix_memalign((void **)&engine->buffer, 4096, length) != 0) {
-        return R101_UNSUPPORTED;
+    r101_local_buffer_metadata *lbm = calloc(1, sizeof(*lbm));
+    if (!lbm) {
+        return R101_NO_MEMORY;
     }
-
-    int slot;
-
-    for (int i = 0; i < MAX_BUFFERS; i++) {
-        if (!engine->lbm[i].mr) {
-            engine->lbm[i].mr = ibv_reg_mr(engine->pd, engine->buffer, length, access);
-            if (!engine->lbm[i].mr) {
-                return R101_NO_MEMORY;
-            }
-            engine->lbm[i].length = length;
-            slot = i;
-            break;
-        }
-        if (i == MAX_BUFFERS - 1) {
-            return R101_NO_MEMORY;
-        }
+    lbm->mr = ibv_reg_mr(engine->pd, engine->buffer, length, access);
+    if (!lbm->mr) {
+        free(lbm);
+        return R101_NO_MEMORY;
     }
+    lbm->length = length;
 
-    *memory = ++engine->lbm_max_id;
+    uint64_t id = ++engine->lbm_max_id;
+    HASH_ADD_INT(engine->lbms, id, lbm);
+
+    *memory = id;
     engine->lbm_count++;
-    *metadata = &(engine->lbm[slot]);
+    *metadata = lbm;
     *metadata_size = sizeof(r101_local_buffer_metadata);
 
     return R101_OK;
@@ -146,16 +138,16 @@ r101_result r101_deregister_local_memory(r101_engine *engine, r101_local_memory_
         return R101_INVALID;
     /* Deregister local memory without freeing the application's buffer. Return BUSY while
      * accepted tasks use it. */
+
     uint64_t id = memory;
-    for (int i = 0; i < MAX_BUFFERS; i++) {
-        if (engine->lbm[i].mr && engine->lbm[i].id == id) {
-            ibv_dereg_mr(engine->lbm[i].mr);
-            engine->lbm[i].mr = NULL;
-            engine->lbm[i].id = 0;
-            break;
-        }
+    r101_local_buffer_metadata *lbm;
+    HASH_FIND_INT(engine->lbms, &id, lbm);
+    if (lbm) {
+        ibv_dereg_mr(lbm->mr);
+        HASH_DEL(engine->lbms, lbm);
     }
-    return R101_UNIMPLEMENTED;
+
+    return R101_OK;
 }
 
 r101_result r101_import_remote_memory(r101_engine *engine,

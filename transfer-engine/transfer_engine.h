@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <infiniband/verbs.h>
 
+#include "uthash.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -14,12 +16,12 @@ extern "C" {
 
 #define R101_ABI_VERSION 1u
 #define BUFFER_SIZE 4096
-#define MAX_BUFFERS 1024
 
 typedef struct r101_local_buffer_metadata {
+    uint64_t id;
     struct ibv_mr *mr;
     uint64_t length;
-    uint64_t id;
+    struct UT_hash_handle hh; /* makes this structure hashable */
 } r101_local_buffer_metadata;
 
 /* Engine objects are opaque; create and destroy them through this API. */
@@ -27,7 +29,7 @@ typedef struct r101_engine {
     struct ibv_context *context;
     struct ibv_pd *pd;
     struct ibv_cq *cq;
-    r101_local_buffer_metadata lbm[MAX_BUFFERS];
+    r101_local_buffer_metadata *lbms;
     uint32_t lbm_count;
     uint32_t lbm_max_id;
     char *buffer;
