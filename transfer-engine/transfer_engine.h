@@ -2,6 +2,7 @@
 #define RDMA101_TRANSFER_ENGINE_H
 
 #include <stdint.h>
+#include <infiniband/verbs.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -12,9 +13,35 @@ extern "C" {
  */
 
 #define R101_ABI_VERSION 1u
+#define BUFFER_SIZE 4096
+#define MAX_BUFFERS 1024
+
+typedef struct r101_local_buffer_metadata {
+    struct ibv_mr *mr;
+    uint64_t length;
+    uint64_t id;
+} r101_local_buffer_metadata;
 
 /* Engine objects are opaque; create and destroy them through this API. */
-typedef struct r101_engine r101_engine;
+typedef struct r101_engine {
+    struct ibv_context *context;
+    struct ibv_pd *pd;
+    struct ibv_cq *cq;
+    r101_local_buffer_metadata lbm[MAX_BUFFERS];
+    uint32_t lbm_count;
+    uint32_t lbm_max_id;
+    char *buffer;
+} r101_engine;
+
+typedef struct r101_peer_info {
+    uint16_t lid;
+    uint32_t qpn;
+    uint32_t psn;
+    uint32_t rkey;
+    uint64_t addr;
+    union ibv_gid gid;
+
+} r101_peer_info;
 
 /* Engine-local integer handles. */
 typedef uint64_t r101_peer_handle;

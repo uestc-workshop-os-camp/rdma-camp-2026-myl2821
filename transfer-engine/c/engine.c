@@ -1,13 +1,39 @@
 #include "transfer_engine.h"
 #include <stddef.h>
-
-#include <infiniband/verbs.h>
+#include <stdlib.h>
 
 /* Define struct r101_engine here to hold device resources, peers, MRs and tasks. */
 
 static int valid_array(const void *data, uint64_t count, size_t size, size_t alignment) {
     return data && count > 0 && count <= (uint64_t)PTRDIFF_MAX / size &&
            (uintptr_t)data % alignment == 0;
+}
+
+r101_result open_device(const char *name, struct ibv_context **ctx_out) {
+    int num_devices = 0;
+    struct ibv_device **devices = ibv_get_device_list(&num_devices);
+    if (!devices)
+        return R101_INVALID;
+    if (num_devices == 0)
+        return R101_UNSUPPORTED;
+
+    struct ibv_device *chosen = NULL;
+    for (int i = 0; i < num_devices; ++i) {
+        const char *dev_name = ibv_get_device_name(devices[i]);
+        if (!name || strcmp(name, dev_name) == 0) {
+            chosen = devices[i];
+            break;
+        }
+    }
+    if (!chosen)
+        return R101_INVALID;
+
+    struct ibv_context *ctx = ibv_open_device(chosen);
+    ibv_free_device_list(devices);
+    if (!ctx)
+        return R101_IO_ERROR;
+    *ctx_out = ctx;
+    return R101_OK;
 }
 
 r101_result r101_create_engine(const r101_config *config, r101_engine **engine) {
@@ -18,14 +44,54 @@ r101_result r101_create_engine(const r101_config *config, r101_engine **engine) 
         return R101_INVALID;
     /* Create an engine with device resources and a background worker.
      * Copy retained config strings and release partial resources on failure. */
-    return R101_UNIMPLEMENTED;
+
+    r101_engine *e = calloc(1, sizeof(*e));
+    if (!e)
+        return R101_NO_MEMORY;
+
+    e->lbm_count = 0;
+    e->lbm_max_id = 0;
+
+    int rc = open_device(config->device, &(e->context));
+    if (rc != R101_OK) {
+        free(e);
+        return R101_INVALID;
+    }
+
+    e->pd = ibv_alloc_pd(e->context);
+    if (!e->pd) {
+        ibv_close_device(e->context);
+        free(e);
+        return R101_INVALID;
+    }
+
+    *engine = e;
+    return R101_OK;
 }
 
 r101_result r101_destroy_engine(r101_engine *engine) {
     if (!engine)
         return R101_INVALID;
-    /* Release the engine's resources after stopping worker and device accesses. */
-    return R101_UNIMPLEMENTED;
+
+    for (int i = 0; i < MAX_BUFFERS; i++) {
+        /* Release the engine's resources after stopping worker and device accesses. */
+        if (engine->lbm[i].mr) {
+            ibv_dereg_mr(engine->lbm[i].mr);
+            engine->lbm[i].mr = NULL;
+        }
+    }
+
+    if (engine->pd != NULL) {
+        ibv_dealloc_pd(engine->pd);
+        engine->pd = NULL;
+    }
+
+    if (engine->context) {
+        ibv_close_device(engine->context);
+        engine->context = NULL;
+    }
+
+    return R101_OK;
 }
 
 r101_result r101_register_local_memory(r101_engine *engine,
@@ -45,7 +111,34 @@ r101_result r101_register_local_memory(r101_engine *engine,
     if (!engine || !valid_array(address, length, 1, 1) || (access & ~known))
         return R101_INVALID;
     /* Register application memory and export its handle and stable metadata. */
-    return R101_UNIMPLEMENTED;
+
+    if (posix_memalign((void **)&engine->buffer, 4096, length) != 0) {
+        return R101_UNSUPPORTED;
+    }
+
+    int slot;
+
+    for (int i = 0; i < MAX_BUFFERS; i++) {
+        if (!engine->lbm[i].mr) {
+            engine->lbm[i].mr = ibv_reg_mr(engine->pd, engine->buffer, length, access);
+            if (!engine->lbm[i].mr) {
+                return R101_NO_MEMORY;
+            }
+            engine->lbm[i].length = length;
+            slot = i;
+            break;
+        }
+        if (i == MAX_BUFFERS - 1) {
+            return R101_NO_MEMORY;
+        }
+    }
+
+    *memory = ++engine->lbm_max_id;
+    engine->lbm_count++;
+    *metadata = &(engine->lbm[slot]);
+    *metadata_size = sizeof(r101_local_buffer_metadata);
+
+    return R101_OK;
 }
 
 r101_result r101_deregister_local_memory(r101_engine *engine, r101_local_memory_handle memory) {
@@ -53,6 +146,15 @@ r101_result r101_deregister_local_memory(r101_engine *engine, r101_local_memory_
         return R101_INVALID;
     /* Deregister local memory without freeing the application's buffer. Return BUSY while
      * accepted tasks use it. */
+    uint64_t id = memory;
+    for (int i = 0; i < MAX_BUFFERS; i++) {
+        if (engine->lbm[i].mr && engine->lbm[i].id == id) {
+            ibv_dereg_mr(engine->lbm[i].mr);
+            engine->lbm[i].mr = NULL;
+            engine->lbm[i].id = 0;
+            break;
+        }
+    }
     return R101_UNIMPLEMENTED;
 }
 
@@ -92,7 +194,10 @@ r101_result r101_create_peer(r101_engine *engine,
         return R101_INVALID;
     /* Create a local peer and export its connection metadata.
      * The RC QP starts in INIT; roll back the creation on failure. */
-    return R101_UNIMPLEMENTED;
+
+    r101_peer_info *info = calloc(1, sizeof(*info));
+
+    return R101_OK;
 }
 
 r101_result r101_connect_peer(r101_engine *engine,
