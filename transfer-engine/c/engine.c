@@ -58,11 +58,33 @@ typedef struct r101_engine {
     uint32_t peer_count;
     uint32_t peer_max_id;
     uint32_t remote_mem_max_id;
+    uint32_t batch_max_id;
 } r101_engine;
 
 static int valid_array(const void *data, uint64_t count, size_t size, size_t alignment) {
     return data && count > 0 && count <= (uint64_t)PTRDIFF_MAX / size &&
            (uintptr_t)data % alignment == 0;
+}
+
+r101_remote_memory *find_remote_memory(r101_peer *peer, r101_rma rma) {
+    r101_remote_memory *rm, *tmp;
+    HASH_ITER(hh, peer->remote_mems, rm, tmp) {
+        if (rm->address <= rma.remote_address && rm->address + rm->length > rma.remote_address) {
+            return rm;
+        }
+    }
+    return NULL;
+}
+
+r101_local_buffer *find_local_buffer(r101_local_buffer *lbs, uint64_t local_address) {
+    r101_local_buffer *lb, *tmp;
+    HASH_ITER(hh, lbs, lb, tmp) {
+        if (lb->exported.address <= local_address &&
+            lb->exported.address + lb->exported.length > local_address) {
+            return lb;
+        }
+    }
+    return NULL;
 }
 
 r101_result open_device(const char *name, struct ibv_context **ctx_out) {
@@ -508,6 +530,57 @@ r101_result r101_submit_transfer(r101_engine *engine,
             return R101_INVALID;
         switch (request->opcode) {
         case R101_WRITE:
+            uint64_t id = request->peer;
+            r101_peer *peer;
+            HASH_FIND_INT(engine->peers, &id, peer);
+            if (!peer) {
+                return R101_INVALID;
+            }
+            if (!peer->connected) {
+                return R101_INVALID_STATE;
+            }
+            r101_remote_memory *rm = find_remote_memory(peer, request->args.rma);
+            if (!rm) {
+                return R101_INVALID;
+            }
+            r101_local_buffer *lb =
+                find_local_buffer(engine->lbs, (uint64_t)(request->local_address));
+            if (!lb) {
+                return R101_INVALID;
+            }
+
+            struct ibv_sge sge;
+            memset(&sge, 0, sizeof(sge));
+            sge.addr = request->local_address;
+            sge.length = request->length;
+            sge.lkey = lb->mr->lkey;
+
+            struct ibv_send_wr wr;
+            memset(&wr, 0, sizeof(wr));
+            wr.wr_id = 1;
+            wr.opcode = IBV_WR_RDMA_WRITE;
+            wr.sg_list = &sge;
+            wr.num_sge = 1;
+            wr.send_flags = IBV_SEND_SIGNALED;
+            wr.wr.rdma.remote_addr = request->args.rma.remote_address;
+            wr.wr.rdma.rkey = rm->rkey;
+
+            struct ibv_send_wr *bad = NULL;
+            if (ibv_post_send(peer->qp, &wr, &bad) != 0) {
+                return R101_IO_ERROR;
+            }
+
+            for (;;) {
+                struct ibv_wc wc;
+                int n = ibv_poll_cq(engine->cq, 1, &wc);
+                if (n < 0)
+                    return R101_IO_ERROR;
+                if (n == 0)
+                    continue;
+                printf("%d\n", wc.status);
+                break;
+            }
+
         case R101_READ:
         case R101_SEND:
         case R101_RECV:
@@ -521,7 +594,8 @@ r101_result r101_submit_transfer(r101_engine *engine,
     }
     /* Submit requests as a new batch for background execution and return its nonzero handle.
      * Copy the descriptors and accept the whole batch or none; buffers remain application-owned. */
-    return R101_UNIMPLEMENTED;
+    *batch = ++engine->batch_max_id;
+    return R101_OK;
 }
 
 r101_result r101_get_transfer_statuses(r101_engine *engine,
