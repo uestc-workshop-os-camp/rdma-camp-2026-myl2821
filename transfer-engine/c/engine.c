@@ -25,24 +25,26 @@ typedef struct r101_peer_info {
     union ibv_gid gid;
 } r101_peer_info;
 
-typedef struct r101_peer_metadata {
+typedef struct r101_local_peer_metadata {
     uint32_t id;
     struct ibv_qp *qp;
     r101_peer_info exported;
     UT_hash_handle hh; /* makes this structure hashable */
-} r101_peer_metadata;
+} r101_local_peer_metadata;
 
 /* Define struct r101_engine here to hold device resources, peers, MRs and tasks. */
 typedef struct r101_engine {
     uint32_t port;
     uint32_t gid_index;
+    enum ibv_mtu active_mtu;
+    uint16_t lid;
     struct ibv_context *context;
     struct ibv_pd *pd;
     struct ibv_cq *cq;
     r101_local_buffer_metadata *lbms;
     uint32_t lbm_count;
     uint32_t lbm_max_id;
-    r101_peer_metadata *pms;
+    r101_local_peer_metadata *pms;
     uint32_t pm_count;
     uint32_t pm_max_id;
 } r101_engine;
@@ -120,6 +122,17 @@ r101_result r101_create_engine(const r101_config *config, r101_engine **engine) 
     e->port = config->port;
     e->gid_index = config->gid_index;
 
+    struct ibv_port_attr port_attr;
+    if (ibv_query_port(e->context, e->port, &port_attr) != 0) {
+        ibv_destroy_cq(e->cq);
+        ibv_dealloc_pd(e->pd);
+        ibv_close_device(e->context);
+        free(e);
+        return R101_IO_ERROR;
+    }
+    e->active_mtu = port_attr.active_mtu;
+    e->lid = port_attr.lid;
+
     *engine = e;
     return R101_OK;
 }
@@ -128,7 +141,7 @@ r101_result r101_destroy_engine(r101_engine *engine) {
     if (!engine)
         return R101_INVALID;
 
-    r101_peer_metadata *pm, *tmp1;
+    r101_local_peer_metadata *pm, *tmp1;
     HASH_ITER(hh, engine->pms, pm, tmp1) {
         ibv_destroy_qp(pm->qp);
         HASH_DEL(engine->pms, pm);
@@ -257,7 +270,7 @@ r101_result r101_create_peer(r101_engine *engine,
     /* Create a local peer and export its connection metadata.
      * The RC QP starts in INIT; roll back the creation on failure. */
 
-    r101_peer_metadata *pm = calloc(1, sizeof(*pm));
+    r101_local_peer_metadata *pm = calloc(1, sizeof(*pm));
     if (!pm) {
         return R101_NO_MEMORY;
     }
@@ -301,9 +314,7 @@ r101_result r101_create_peer(r101_engine *engine,
         return R101_IO_ERROR;
     }
 
-    struct ibv_port_attr pattr;
-    if (ibv_query_port(engine->context, engine->port, &pattr) == 0)
-        pm->exported.lid = pattr.lid;
+    pm->exported.lid = engine->lid;
 
     uint64_t id = ++engine->pm_max_id;
     pm->id = id;
@@ -317,6 +328,15 @@ r101_result r101_create_peer(r101_engine *engine,
     return R101_OK;
 }
 
+static enum ibv_mtu choose_mtu(enum ibv_mtu active_mtu) {
+    return active_mtu < IBV_MTU_1024 ? active_mtu : IBV_MTU_1024;
+}
+
+static int gid_is_zero(union ibv_gid gid) {
+    static const union ibv_gid zero;
+    return memcmp(&gid, &zero, sizeof(gid)) == 0;
+}
+
 r101_result r101_connect_peer(r101_engine *engine,
                               r101_peer_handle peer,
                               const void *metadata,
@@ -326,9 +346,53 @@ r101_result r101_connect_peer(r101_engine *engine,
     /* Complete the local side of a connection using the remote peer's metadata.
      * Copy retained fields and move the QP to RTR/RTS. */
 
-    r101_peer_info *pi = (r101_peer_info *)metadata;
+    r101_peer_info *remote = (r101_peer_info *)metadata;
 
-    return R101_UNIMPLEMENTED;
+    uint64_t id = peer;
+    r101_local_peer_metadata *lpm;
+    HASH_FIND_INT(engine->pms, &id, lpm);
+    if (!lpm) {
+        return R101_INVALID;
+    }
+
+    struct ibv_qp_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state = IBV_QPS_RTR;
+    attr.path_mtu = choose_mtu(engine->active_mtu);
+    attr.dest_qp_num = remote->qpn;
+    attr.rq_psn = remote->psn;
+    attr.max_dest_rd_atomic = 1;
+    attr.min_rnr_timer = 12;
+    attr.ah_attr.dlid = remote->lid;
+    attr.ah_attr.sl = 0;
+    attr.ah_attr.src_path_bits = 0;
+    attr.ah_attr.port_num = engine->port;
+    if (!gid_is_zero(remote->gid)) {
+        attr.ah_attr.is_global = 1;
+        attr.ah_attr.grh.dgid = remote->gid;
+        attr.ah_attr.grh.sgid_index = engine->gid_index;
+        attr.ah_attr.grh.hop_limit = 1;
+    }
+
+    int flags = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+                IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+    if (ibv_modify_qp(lpm->qp, &attr, flags) != 0)
+        return R101_IO_ERROR;
+
+    memset(&attr, 0, sizeof(attr));
+    attr.qp_state = IBV_QPS_RTS;
+    attr.timeout = 14;
+    attr.retry_cnt = 7;
+    attr.rnr_retry = 7;
+    attr.sq_psn = lpm->exported.psn;
+    attr.max_rd_atomic = 1;
+
+    flags = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
+            IBV_QP_MAX_QP_RD_ATOMIC;
+    if (ibv_modify_qp(lpm->qp, &attr, flags) != 0)
+        return R101_IO_ERROR;
+
+    return R101_OK;
 }
 
 r101_result r101_destroy_peer(r101_engine *engine, r101_peer_handle peer) {
