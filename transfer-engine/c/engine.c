@@ -244,6 +244,7 @@ r101_result r101_deregister_local_memory(r101_engine *engine, r101_local_memory_
     if (lbm) {
         ibv_dereg_mr(lbm->mr);
         HASH_DEL(engine->lbs, lbm);
+        --engine->buffer_count;
     }
 
     return R101_OK;
@@ -389,7 +390,7 @@ r101_result r101_create_peer(r101_engine *engine,
     return R101_OK;
 }
 
-static enum ibv_mtu choose_mtu(enum ibv_mtu active_mtu) {
+static inline enum ibv_mtu choose_mtu(enum ibv_mtu active_mtu) {
     return active_mtu < IBV_MTU_1024 ? active_mtu : IBV_MTU_1024;
 }
 
