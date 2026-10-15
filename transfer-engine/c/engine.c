@@ -461,11 +461,32 @@ r101_result r101_connect_peer(r101_engine *engine,
     return R101_OK;
 }
 
-r101_result r101_destroy_peer(r101_engine *engine, r101_peer_handle peer) {
-    if (!engine || !peer)
+r101_result r101_destroy_peer(r101_engine *engine, r101_peer_handle h) {
+    if (!engine || !h)
         return R101_INVALID;
+
     /* Destroy this peer and its imports after stopping its work and handling completions. */
-    return R101_UNIMPLEMENTED;
+    uint64_t id = (uint64_t)h;
+    r101_peer *peer;
+    HASH_FIND_INT(engine->peers, &id, peer);
+    if (!peer) {
+        return R101_INVALID;
+    }
+
+    if (peer->qp) {
+        ibv_destroy_qp(peer->qp);
+        peer->qp = NULL;
+    }
+    r101_remote_memory *rm, *tmp;
+    HASH_ITER(hh, peer->remote_mems, rm, tmp) {
+        HASH_DEL(peer->remote_mems, rm);
+        free(rm);
+    }
+
+    HASH_DEL(engine->peers, peer);
+    free(peer);
+    --engine->peer_count;
+    return R101_OK;
 }
 
 r101_result r101_submit_transfer(r101_engine *engine,
