@@ -5,32 +5,42 @@
 
 #include "uthash.h"
 
-typedef struct r101_memory_info {
+typedef struct r101_memory_exchange {
     uint64_t address;
     uint64_t length;
     uint32_t rkey;
-} r101_memory_info;
+} r101_memory_exchange;
 
-typedef struct r101_local_buffer_metadata {
+typedef struct r101_local_buffer {
     uint32_t id;
     struct ibv_mr *mr;
-    r101_memory_info exported;
+    r101_memory_exchange exported;
     UT_hash_handle hh; /* makes this structure hashable */
-} r101_local_buffer_metadata;
+} r101_local_buffer;
 
-typedef struct r101_peer_info {
+typedef struct r101_peer_exchange {
     uint16_t lid;
     uint32_t qpn;
     uint32_t psn;
     union ibv_gid gid;
-} r101_peer_info;
+} r101_peer_exchange;
 
-typedef struct r101_local_peer_metadata {
+typedef struct r101_remote_memory {
+    uint32_t id;
+    uint64_t address;
+    uint64_t length;
+    uint32_t rkey;
+    UT_hash_handle hh; /* makes this structure hashable */
+} r101_remote_memory;
+
+typedef struct r101_peer {
     uint32_t id;
     struct ibv_qp *qp;
-    r101_peer_info exported;
-    UT_hash_handle hh; /* makes this structure hashable */
-} r101_local_peer_metadata;
+    r101_peer_exchange exported;
+    int connected;
+    r101_remote_memory *remote_mems; /* imported remote memories for this peer */
+    UT_hash_handle hh;               /* makes this structure hashable */
+} r101_peer;
 
 /* Define struct r101_engine here to hold device resources, peers, MRs and tasks. */
 typedef struct r101_engine {
@@ -41,12 +51,13 @@ typedef struct r101_engine {
     struct ibv_context *context;
     struct ibv_pd *pd;
     struct ibv_cq *cq;
-    r101_local_buffer_metadata *lbms;
-    uint32_t lbm_count;
-    uint32_t lbm_max_id;
-    r101_local_peer_metadata *pms;
-    uint32_t pm_count;
-    uint32_t pm_max_id;
+    r101_local_buffer *lbs;
+    uint32_t buffer_count;
+    uint32_t buffer_max_id;
+    r101_peer *peers;
+    uint32_t peer_count;
+    uint32_t peer_max_id;
+    uint32_t remote_mem_max_id;
 } r101_engine;
 
 static int valid_array(const void *data, uint64_t count, size_t size, size_t alignment) {
@@ -94,9 +105,9 @@ r101_result r101_create_engine(const r101_config *config, r101_engine **engine) 
     if (!e)
         return R101_NO_MEMORY;
 
-    e->lbm_count = 0;
-    e->lbm_max_id = 0;
-    e->pm_max_id = 0;
+    e->buffer_count = 0;
+    e->buffer_max_id = 0;
+    e->peer_max_id = 0;
 
     int rc = open_device(config->device, &(e->context));
     if (rc != R101_OK) {
@@ -141,17 +152,22 @@ r101_result r101_destroy_engine(r101_engine *engine) {
     if (!engine)
         return R101_INVALID;
 
-    r101_local_peer_metadata *pm, *tmp1;
-    HASH_ITER(hh, engine->pms, pm, tmp1) {
+    r101_peer *pm, *tmp1;
+    HASH_ITER(hh, engine->peers, pm, tmp1) {
         ibv_destroy_qp(pm->qp);
-        HASH_DEL(engine->pms, pm);
+        r101_remote_memory *rm, *tmp3;
+        HASH_ITER(hh, pm->remote_mems, rm, tmp3) {
+            HASH_DEL(pm->remote_mems, rm);
+            free(rm);
+        }
+        HASH_DEL(engine->peers, pm);
         free(pm);
     }
 
-    r101_local_buffer_metadata *lbm, *tmp2;
-    HASH_ITER(hh, engine->lbms, lbm, tmp2) {
+    r101_local_buffer *lbm, *tmp2;
+    HASH_ITER(hh, engine->lbs, lbm, tmp2) {
         ibv_dereg_mr(lbm->mr);
-        HASH_DEL(engine->lbms, lbm);
+        HASH_DEL(engine->lbs, lbm);
         free(lbm);
     }
 
@@ -191,7 +207,7 @@ r101_result r101_register_local_memory(r101_engine *engine,
         return R101_INVALID;
     /* Register application memory and export its handle and stable metadata. */
 
-    r101_local_buffer_metadata *lbm = calloc(1, sizeof(*lbm));
+    r101_local_buffer *lbm = calloc(1, sizeof(*lbm));
     if (!lbm) {
         return R101_NO_MEMORY;
     }
@@ -204,14 +220,14 @@ r101_result r101_register_local_memory(r101_engine *engine,
     lbm->exported.length = length;
     lbm->exported.rkey = lbm->mr->rkey;
 
-    uint64_t id = ++engine->lbm_max_id;
+    uint64_t id = ++engine->buffer_max_id;
     lbm->id = id;
-    HASH_ADD_INT(engine->lbms, id, lbm);
+    HASH_ADD_INT(engine->lbs, id, lbm);
 
     *memory = id;
-    engine->lbm_count++;
+    engine->buffer_count++;
     *metadata = &lbm->exported;
-    *metadata_size = sizeof(r101_memory_info);
+    *metadata_size = sizeof(r101_memory_exchange);
 
     return R101_OK;
 }
@@ -223,11 +239,11 @@ r101_result r101_deregister_local_memory(r101_engine *engine, r101_local_memory_
      * accepted tasks use it. */
 
     uint64_t id = memory;
-    r101_local_buffer_metadata *lbm;
-    HASH_FIND_INT(engine->lbms, &id, lbm);
+    r101_local_buffer *lbm;
+    HASH_FIND_INT(engine->lbs, &id, lbm);
     if (lbm) {
         ibv_dereg_mr(lbm->mr);
-        HASH_DEL(engine->lbms, lbm);
+        HASH_DEL(engine->lbs, lbm);
     }
 
     return R101_OK;
@@ -241,11 +257,43 @@ r101_result r101_import_remote_memory(r101_engine *engine,
     if (!remote_memory)
         return R101_INVALID;
     *remote_memory = 0;
-    if (!engine || !peer || !valid_array(metadata, metadata_size, 1, 1))
+    if (!engine || !peer || !metadata || metadata_size != sizeof(r101_memory_exchange))
         return R101_INVALID;
     /* Import a connected peer's memory registration and return a local handle.
      * Reuse identical live imports; reject conflicting overlapping regions. */
-    return R101_UNIMPLEMENTED;
+
+    r101_memory_exchange *info = (r101_memory_exchange *)metadata;
+
+    uint32_t pid = (uint32_t)peer;
+    r101_peer *pm;
+    HASH_FIND_INT(engine->peers, &pid, pm);
+    if (!pm)
+        return R101_INVALID;
+    if (!pm->connected)
+        return R101_INVALID_STATE;
+
+    r101_remote_memory *rm, *tmp;
+    HASH_ITER(hh, pm->remote_mems, rm, tmp) {
+        if (rm->address == info->address && rm->length == info->length && rm->rkey == info->rkey) {
+            *remote_memory = rm->id;
+            return R101_OK;
+        }
+        if (rm->address < info->address + info->length && info->address < rm->address + rm->length)
+            return R101_INVALID;
+    }
+
+    r101_remote_memory *entry = calloc(1, sizeof(*entry));
+    if (!entry)
+        return R101_NO_MEMORY;
+    entry->address = info->address;
+    entry->length = info->length;
+    entry->rkey = info->rkey;
+    uint32_t handle = ++engine->remote_mem_max_id;
+    entry->id = handle;
+    HASH_ADD_INT(pm->remote_mems, id, entry);
+
+    *remote_memory = handle;
+    return R101_OK;
 }
 
 r101_result r101_remove_remote_memory(r101_engine *engine,
@@ -253,7 +301,20 @@ r101_result r101_remove_remote_memory(r101_engine *engine,
     if (!engine || !remote_memory)
         return R101_INVALID;
     /* Remove the imported descriptor unless an accepted task still uses it. */
-    return R101_UNIMPLEMENTED;
+
+    uint32_t id = (uint32_t)remote_memory;
+    r101_peer *pm, *tmp;
+    HASH_ITER(hh, engine->peers, pm, tmp) {
+        r101_remote_memory *rm;
+        HASH_FIND_INT(pm->remote_mems, &id, rm);
+        if (rm) {
+            HASH_DEL(pm->remote_mems, rm);
+            free(rm);
+            return R101_OK;
+        }
+    }
+
+    return R101_INVALID;
 }
 
 r101_result r101_create_peer(r101_engine *engine,
@@ -270,7 +331,7 @@ r101_result r101_create_peer(r101_engine *engine,
     /* Create a local peer and export its connection metadata.
      * The RC QP starts in INIT; roll back the creation on failure. */
 
-    r101_local_peer_metadata *pm = calloc(1, sizeof(*pm));
+    r101_peer *pm = calloc(1, sizeof(*pm));
     if (!pm) {
         return R101_NO_MEMORY;
     }
@@ -316,14 +377,14 @@ r101_result r101_create_peer(r101_engine *engine,
 
     pm->exported.lid = engine->lid;
 
-    uint64_t id = ++engine->pm_max_id;
+    uint64_t id = ++engine->peer_max_id;
     pm->id = id;
-    HASH_ADD_INT(engine->pms, id, pm);
+    HASH_ADD_INT(engine->peers, id, pm);
 
     *peer = id;
-    engine->pm_count++;
+    engine->peer_count++;
     *metadata = &pm->exported;
-    *metadata_size = sizeof(r101_peer_info);
+    *metadata_size = sizeof(r101_peer_exchange);
 
     return R101_OK;
 }
@@ -341,18 +402,21 @@ r101_result r101_connect_peer(r101_engine *engine,
                               r101_peer_handle peer,
                               const void *metadata,
                               uint64_t metadata_size) {
-    if (!engine || !peer || !valid_array(metadata, metadata_size, 1, 1))
+    if (!engine || !peer || !metadata || metadata_size != sizeof(r101_peer_exchange))
         return R101_INVALID;
     /* Complete the local side of a connection using the remote peer's metadata.
      * Copy retained fields and move the QP to RTR/RTS. */
 
-    r101_peer_info *remote = (r101_peer_info *)metadata;
+    const r101_peer_exchange *remote = (const r101_peer_exchange *)metadata;
 
     uint64_t id = peer;
-    r101_local_peer_metadata *lpm;
-    HASH_FIND_INT(engine->pms, &id, lpm);
+    r101_peer *lpm;
+    HASH_FIND_INT(engine->peers, &id, lpm);
     if (!lpm) {
         return R101_INVALID;
+    }
+    if (lpm->connected) {
+        return R101_INVALID_STATE;
     }
 
     struct ibv_qp_attr attr;
@@ -391,6 +455,8 @@ r101_result r101_connect_peer(r101_engine *engine,
             IBV_QP_MAX_QP_RD_ATOMIC;
     if (ibv_modify_qp(lpm->qp, &attr, flags) != 0)
         return R101_IO_ERROR;
+
+    lpm->connected = 1;
 
     return R101_OK;
 }
