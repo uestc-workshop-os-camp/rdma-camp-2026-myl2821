@@ -22,6 +22,7 @@ typedef struct r101_memory_exchange {
 
 typedef struct r101_local_buffer {
     uint32_t id;
+    uint32_t access;
     struct ibv_mr *mr;
     r101_memory_exchange exported;
     UT_hash_handle hh; /* makes this structure hashable */
@@ -186,9 +187,9 @@ validate_submission(r101_engine *engine, const r101_request *requests, uint64_t 
             request->opcode != R101_SEND && request->opcode != R101_WRITE_IMM)
             return R101_INVALID;
         if (request->opcode != R101_WRITE && request->opcode != R101_SEND &&
-            request->opcode != R101_RECV && request->opcode != R101_WRITE_IMM) {
+            request->opcode != R101_RECV && request->opcode != R101_WRITE_IMM &&
+            request->opcode != R101_READ) {
             switch (request->opcode) {
-            case R101_READ:
             case R101_COMPARE_SWAP:
             case R101_FETCH_ADD:
                 return R101_UNSUPPORTED;
@@ -204,14 +205,20 @@ validate_submission(r101_engine *engine, const r101_request *requests, uint64_t 
         if (request->length == 0)
             continue;
         int local_required = !(request->flags & R101_INLINE);
-        if (local_required && !find_local_buffer(engine,
-                                                 (uint64_t)(uintptr_t)request->local_address,
-                                                 request->length))
-            return R101_INVALID;
-        if (request->opcode == R101_WRITE || request->opcode == R101_WRITE_IMM) {
-            uint64_t remote = request->opcode == R101_WRITE
-                                  ? request->args.rma.remote_address
-                                  : request->args.write_imm.remote_address;
+        if (local_required) {
+            r101_local_buffer *lb = find_local_buffer(
+                engine, (uint64_t)(uintptr_t)request->local_address, request->length);
+            if (!lb)
+                return R101_INVALID;
+            if ((request->opcode == R101_READ || request->opcode == R101_RECV) &&
+                !(lb->access & R101_LOCAL_WRITE))
+                return R101_INVALID;
+        }
+        if (request->opcode == R101_WRITE || request->opcode == R101_WRITE_IMM ||
+            request->opcode == R101_READ) {
+            uint64_t remote = request->opcode == R101_WRITE_IMM
+                                  ? request->args.write_imm.remote_address
+                                  : request->args.rma.remote_address;
             if (!find_remote_memory(peer, remote, request->length))
                 return R101_INVALID;
         }
@@ -222,6 +229,7 @@ validate_submission(r101_engine *engine, const r101_request *requests, uint64_t 
 static uint64_t request_slices_count(const r101_request *request) {
     switch (request->opcode) {
     case R101_WRITE:
+    case R101_READ:
         return request->length == 0 ? 0 : (request->length + R101_SLICE_SIZE - 1) / R101_SLICE_SIZE;
     case R101_WRITE_IMM:
         return request->length == 0 ? 1 : (request->length + R101_SLICE_SIZE - 1) / R101_SLICE_SIZE;
@@ -385,7 +393,7 @@ static void fill_slice_wr(struct ibv_send_wr *wr,
                           uint32_t rkey,
                           int with_imm) {
     memset(wr, 0, sizeof(*wr));
-    wr->opcode = IBV_WR_RDMA_WRITE;
+    wr->opcode = request->opcode == R101_READ ? IBV_WR_RDMA_READ : IBV_WR_RDMA_WRITE;
     wr->sg_list = group;
     wr->num_sge = (int)count;
     wr->wr.rdma.remote_addr = remote + first_slice * R101_SLICE_SIZE;
@@ -615,7 +623,8 @@ static int lookup_request(r101_engine *engine,
         *lkey = lb->mr->lkey;
     }
     if (request->length > 0 &&
-        (request->opcode == R101_WRITE || request->opcode == R101_WRITE_IMM)) {
+        (request->opcode == R101_WRITE || request->opcode == R101_WRITE_IMM ||
+         request->opcode == R101_READ)) {
         uint64_t remote = request->opcode == R101_WRITE ? request->args.rma.remote_address
                                                         : request->args.write_imm.remote_address;
         r101_remote_memory *rm = find_remote_memory(peer, remote, request->length);
@@ -1004,6 +1013,7 @@ r101_result r101_register_local_memory(r101_engine *engine,
         free(lbm);
         return R101_NO_MEMORY;
     }
+    lbm->access = access;
     lbm->exported.address = (uint64_t)(uintptr_t)address;
     lbm->exported.length = length;
     lbm->exported.rkey = lbm->mr->rkey;
@@ -1245,7 +1255,7 @@ r101_result r101_connect_peer(r101_engine *engine,
     attr.dest_qp_num = remote->qpn;
     attr.rq_psn = remote->psn;
     attr.max_dest_rd_atomic = 1;
-    attr.min_rnr_timer = 16;
+    attr.min_rnr_timer = 1;
     attr.ah_attr.dlid = remote->lid;
     attr.ah_attr.sl = 0;
     attr.ah_attr.src_path_bits = 0;
