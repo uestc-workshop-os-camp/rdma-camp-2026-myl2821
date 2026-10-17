@@ -56,6 +56,7 @@ typedef struct r101_peer {
     struct ibv_qp *qp;
     r101_peer_exchange exported;
     int connected;
+    uint32_t inline_limit;
     uint32_t send_capacity;
     uint32_t inflight;
     uint32_t recv_capacity;
@@ -202,6 +203,8 @@ validate_submission(r101_engine *engine, const r101_request *requests, uint64_t 
             return R101_INVALID;
         if (request->opcode != R101_RECV && !peer->connected)
             return R101_INVALID_STATE;
+        if ((request->flags & R101_INLINE) && request->length > peer->inline_limit)
+            return R101_UNSUPPORTED;
         if (request->length == 0)
             continue;
         int local_required = !(request->flags & R101_INLINE);
@@ -1173,6 +1176,7 @@ r101_result r101_create_peer(r101_engine *engine,
         free(pm);
         return R101_IO_ERROR;
     }
+    pm->inline_limit = qp_init.cap.max_inline_data;
     pm->send_capacity = qp_init.cap.max_send_wr;
     pm->recv_capacity = qp_init.cap.max_recv_wr;
 
