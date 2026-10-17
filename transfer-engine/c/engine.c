@@ -7,6 +7,8 @@
 
 #include "uthash.h"
 
+#define R101_SLICE_SIZE (64u * 1024u)
+
 typedef struct r101_memory_exchange {
     uint64_t address;
     uint64_t length;
@@ -40,6 +42,8 @@ typedef struct r101_peer {
     struct ibv_qp *qp;
     r101_peer_exchange exported;
     int connected;
+    uint32_t send_capacity;
+    uint32_t inflight;
     r101_remote_memory *remote_mems; /* imported remote memories for this peer */
     UT_hash_handle hh;               /* makes this structure hashable */
 } r101_peer;
@@ -48,6 +52,9 @@ typedef struct batch_result {
     uint32_t id;
     uint32_t count;
     r101_transfer_status *status;
+    uint64_t *remaining;
+    uint8_t *failed;
+    r101_peer_handle *peers;
     UT_hash_handle hh; /* makes this structure hashable */
 } batch_result;
 
@@ -55,6 +62,8 @@ typedef struct pending_batch {
     batch_result *batch;
     r101_request *requests;
     uint32_t count;
+    uint32_t index;
+    uint64_t slice;
     struct pending_batch *next;
 } pending_batch;
 
@@ -171,20 +180,90 @@ static void record_completion(r101_engine *engine, const struct ibv_wc *wc) {
     HASH_FIND_INT(engine->batch_results, &id, bs);
     if (!bs || index >= bs->count)
         return;
-    if (wc->status == IBV_WC_SUCCESS) {
-        bs->status[index].state = R101_COMPLETED;
-    } else {
-        bs->status[index].state = R101_FAILED;
-        bs->status[index].error = R101_IO_ERROR;
+    r101_peer *peer = find_peer(engine, bs->peers[index]);
+    if (peer && peer->inflight > 0)
+        --peer->inflight;
+    if (bs->remaining[index] == 0)
+        return;
+    if (wc->status != IBV_WC_SUCCESS)
+        bs->failed[index] = 1;
+    if (--bs->remaining[index] == 0) {
+        bs->status[index].state = bs->failed[index] ? R101_FAILED : R101_COMPLETED;
+        bs->status[index].error = bs->failed[index] ? R101_IO_ERROR : R101_OK;
     }
 }
 
-static void post_batch(r101_engine *engine, pending_batch *pending) {
-    batch_result *bs = pending->batch;
-    for (uint64_t i = 0; i < pending->count; ++i) {
-        const r101_request *request = &pending->requests[i];
-        if (request->opcode != R101_WRITE || request->length == 0)
+static uint64_t ensure_slices(uint64_t slice,
+                              uint64_t length,
+                              uint64_t limit,
+                              uint64_t local,
+                              uint64_t remote,
+                              uint32_t lkey,
+                              uint32_t rkey,
+                              uint64_t wr_id,
+                              struct ibv_send_wr **wrs_out,
+                              struct ibv_sge **sges_out) {
+    uint64_t start = slice * R101_SLICE_SIZE;
+    if (start >= length || limit == 0)
+        return 0;
+    uint64_t slices = (length - start + R101_SLICE_SIZE - 1) / R101_SLICE_SIZE;
+    if (slices > limit)
+        slices = limit;
+
+    struct ibv_send_wr *wrs = calloc(slices, sizeof(*wrs));
+    struct ibv_sge *sges = calloc(slices, sizeof(*sges));
+    if (!wrs || !sges) {
+        free(wrs);
+        free(sges);
+        return 0;
+    }
+
+    for (uint64_t s = 0; s < slices; ++s) {
+        uint64_t offset = start + s * R101_SLICE_SIZE;
+        uint64_t chunk = length - offset;
+        if (chunk > R101_SLICE_SIZE)
+            chunk = R101_SLICE_SIZE;
+        sges[s].addr = local + offset;
+        sges[s].length = (uint32_t)chunk;
+        sges[s].lkey = lkey;
+        wrs[s].wr_id = wr_id;
+        wrs[s].opcode = IBV_WR_RDMA_WRITE;
+        wrs[s].sg_list = &sges[s];
+        wrs[s].num_sge = 1;
+        wrs[s].send_flags = IBV_SEND_SIGNALED;
+        wrs[s].wr.rdma.remote_addr = remote + offset;
+        wrs[s].wr.rdma.rkey = rkey;
+        wrs[s].next = s + 1 < slices ? &wrs[s + 1] : NULL;
+    }
+
+    *wrs_out = wrs;
+    *sges_out = sges;
+    return slices;
+}
+
+static void post_pending(r101_engine *engine) {
+    while (engine->pending_head) {
+        pending_batch *pending = engine->pending_head;
+        batch_result *bs = pending->batch;
+
+        if (pending->index >= pending->count) {
+            engine->pending_head = pending->next;
+            if (!engine->pending_head)
+                engine->pending_tail = NULL;
+            free(pending->requests);
+            free(pending);
             continue;
+        }
+
+        uint32_t i = pending->index;
+        const r101_request *request = &pending->requests[i];
+        if (request->opcode != R101_WRITE || request->length == 0) {
+            pending->index++;
+            pending->slice = 0;
+            continue;
+        }
+
+        uint64_t total = (request->length + R101_SLICE_SIZE - 1) / R101_SLICE_SIZE;
         r101_peer *peer = find_peer(engine, request->peer);
         r101_remote_memory *rm =
             peer ? find_remote_memory(peer, request->args.rma.remote_address, request->length)
@@ -192,32 +271,79 @@ static void post_batch(r101_engine *engine, pending_batch *pending) {
         r101_local_buffer *lb =
             find_local_buffer(engine, (uint64_t)(uintptr_t)request->local_address, request->length);
         if (!peer || !peer->connected || !rm || !lb) {
-            bs->status[i].state = R101_FAILED;
-            bs->status[i].error = R101_INVALID_STATE;
+            bs->remaining[i] -= total - pending->slice;
+            bs->failed[i] = 1;
+            if (bs->remaining[i] == 0) {
+                bs->status[i].state = R101_FAILED;
+                bs->status[i].error = R101_INVALID_STATE;
+            }
+            pending->index++;
+            pending->slice = 0;
             continue;
         }
 
-        struct ibv_sge sge;
-        memset(&sge, 0, sizeof(sge));
-        sge.addr = (uint64_t)(uintptr_t)request->local_address;
-        sge.length = request->length;
-        sge.lkey = lb->mr->lkey;
+        uint64_t capacity =
+            peer->send_capacity > peer->inflight ? peer->send_capacity - peer->inflight : 0;
+        if (capacity == 0)
+            return;
 
-        struct ibv_send_wr wr;
-        memset(&wr, 0, sizeof(wr));
-        wr.wr_id = ((uint64_t)bs->id << 32) | (i & 0xffffffffu);
-        wr.opcode = IBV_WR_RDMA_WRITE;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.send_flags = IBV_SEND_SIGNALED;
-        wr.wr.rdma.remote_addr = request->args.rma.remote_address;
-        wr.wr.rdma.rkey = rm->rkey;
+        uint64_t want = total - pending->slice;
+        if (want > capacity)
+            want = capacity;
+
+        struct ibv_send_wr *wrs = NULL;
+        struct ibv_sge *sges = NULL;
+        uint64_t built = ensure_slices(pending->slice,
+                                       request->length,
+                                       want,
+                                       (uint64_t)(uintptr_t)request->local_address,
+                                       request->args.rma.remote_address,
+                                       lb->mr->lkey,
+                                       rm->rkey,
+                                       ((uint64_t)bs->id << 32) | (i & 0xffffffffu),
+                                       &wrs,
+                                       &sges);
+        if (built == 0) {
+            bs->remaining[i] -= total - pending->slice;
+            bs->failed[i] = 1;
+            if (bs->remaining[i] == 0) {
+                bs->status[i].state = R101_FAILED;
+                bs->status[i].error = R101_NO_MEMORY;
+            }
+            pending->index++;
+            pending->slice = 0;
+            continue;
+        }
 
         struct ibv_send_wr *bad = NULL;
-        if (ibv_post_send(peer->qp, &wr, &bad) != 0) {
-            bs->status[i].state = R101_FAILED;
-            bs->status[i].error = R101_IO_ERROR;
+        int rc = ibv_post_send(peer->qp, &wrs[0], &bad);
+        uint64_t accepted = 0;
+        if (rc == 0) {
+            accepted = built;
+        } else {
+            for (uint64_t s = 0; s < built && &wrs[s] != bad; ++s)
+                accepted = s + 1;
         }
+        peer->inflight += (uint32_t)accepted;
+
+        if (accepted < built) {
+            bs->remaining[i] -= total - (pending->slice + accepted);
+            bs->failed[i] = 1;
+            if (bs->remaining[i] == 0) {
+                bs->status[i].state = R101_FAILED;
+                bs->status[i].error = R101_IO_ERROR;
+            }
+            pending->index++;
+            pending->slice = 0;
+        } else {
+            pending->slice += accepted;
+            if (pending->slice == total) {
+                pending->index++;
+                pending->slice = 0;
+            }
+        }
+        free(wrs);
+        free(sges);
     }
 }
 
@@ -230,15 +356,7 @@ static void *poll_worker(void *arg) {
             pthread_mutex_unlock(&engine->lock);
             break;
         }
-        while (engine->pending_head) {
-            pending_batch *pending = engine->pending_head;
-            engine->pending_head = pending->next;
-            if (!engine->pending_head)
-                engine->pending_tail = NULL;
-            post_batch(engine, pending);
-            free(pending->requests);
-            free(pending);
-        }
+        post_pending(engine);
         struct ibv_wc wc[16];
         int n = ibv_poll_cq(engine->cq, 16, wc);
         for (int i = 0; i < n; ++i)
@@ -393,6 +511,9 @@ r101_result r101_destroy_engine(r101_engine *engine) {
     HASH_ITER(hh, engine->batch_results, bs, tmp4) {
         HASH_DEL(engine->batch_results, bs);
         free(bs->status);
+        free(bs->remaining);
+        free(bs->failed);
+        free(bs->peers);
         free(bs);
     }
 
@@ -578,6 +699,7 @@ r101_result r101_create_peer(r101_engine *engine,
         free(pm);
         return R101_IO_ERROR;
     }
+    pm->send_capacity = qp_init.cap.max_send_wr;
 
     struct ibv_qp_attr attr;
     memset(&attr, 0, sizeof(attr));
@@ -741,10 +863,16 @@ r101_result r101_submit_transfer(r101_engine *engine,
     }
     bs->count = (uint32_t)count;
     bs->status = calloc(count, sizeof(*bs->status));
+    bs->remaining = calloc(count, sizeof(*bs->remaining));
+    bs->failed = calloc(count, sizeof(*bs->failed));
+    bs->peers = calloc(count, sizeof(*bs->peers));
     pending->count = (uint32_t)count;
     pending->requests = calloc(count, sizeof(*pending->requests));
-    if (!bs->status || !pending->requests) {
+    if (!bs->status || !bs->remaining || !bs->failed || !bs->peers || !pending->requests) {
         free(bs->status);
+        free(bs->remaining);
+        free(bs->failed);
+        free(bs->peers);
         free(pending->requests);
         free(bs);
         free(pending);
@@ -753,8 +881,12 @@ r101_result r101_submit_transfer(r101_engine *engine,
     memcpy(pending->requests, requests, count * sizeof(*requests));
     pending->batch = bs;
     for (uint64_t i = 0; i < count; ++i) {
+        bs->peers[i] = pending->requests[i].peer;
         if (pending->requests[i].length == 0)
             bs->status[i].state = R101_COMPLETED;
+        else
+            bs->remaining[i] =
+                (pending->requests[i].length + R101_SLICE_SIZE - 1) / R101_SLICE_SIZE;
     }
 
     pthread_mutex_lock(&engine->lock);
@@ -818,6 +950,9 @@ r101_result r101_free_batch(r101_engine *engine, r101_batch_handle batch) {
     HASH_DEL(engine->batch_results, bs);
     pthread_mutex_unlock(&engine->lock);
     free(bs->status);
+    free(bs->remaining);
+    free(bs->failed);
+    free(bs->peers);
     free(bs);
 
     return R101_OK;
