@@ -1,7 +1,9 @@
 #include "transfer_engine.h"
+#include <pthread.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "uthash.h"
 
@@ -49,6 +51,13 @@ typedef struct batch_result {
     UT_hash_handle hh; /* makes this structure hashable */
 } batch_result;
 
+typedef struct pending_batch {
+    batch_result *batch;
+    r101_request *requests;
+    uint32_t count;
+    struct pending_batch *next;
+} pending_batch;
+
 /* Define struct r101_engine here to hold device resources, peers, MRs and tasks. */
 typedef struct r101_engine {
     uint32_t port;
@@ -72,6 +81,13 @@ typedef struct r101_engine {
 
     batch_result *batch_results;
     uint32_t batch_max_id;
+
+    pending_batch *pending_head;
+    pending_batch *pending_tail;
+
+    pthread_t worker;
+    pthread_mutex_t lock;
+    int stop;
 } r101_engine;
 
 static int valid_array(const void *data, uint64_t count, size_t size, size_t alignment) {
@@ -146,6 +162,92 @@ validate_submission(r101_engine *engine, const r101_request *requests, uint64_t 
             return R101_INVALID;
     }
     return R101_OK;
+}
+
+static void record_completion(r101_engine *engine, const struct ibv_wc *wc) {
+    uint32_t id = (uint32_t)(wc->wr_id >> 32);
+    uint64_t index = wc->wr_id & 0xffffffffu;
+    batch_result *bs;
+    HASH_FIND_INT(engine->batch_results, &id, bs);
+    if (!bs || index >= bs->count)
+        return;
+    if (wc->status == IBV_WC_SUCCESS) {
+        bs->status[index].state = R101_COMPLETED;
+    } else {
+        bs->status[index].state = R101_FAILED;
+        bs->status[index].error = R101_IO_ERROR;
+    }
+}
+
+static void post_batch(r101_engine *engine, pending_batch *pending) {
+    batch_result *bs = pending->batch;
+    for (uint64_t i = 0; i < pending->count; ++i) {
+        const r101_request *request = &pending->requests[i];
+        if (request->opcode != R101_WRITE || request->length == 0)
+            continue;
+        r101_peer *peer = find_peer(engine, request->peer);
+        r101_remote_memory *rm =
+            peer ? find_remote_memory(peer, request->args.rma.remote_address, request->length)
+                 : NULL;
+        r101_local_buffer *lb =
+            find_local_buffer(engine, (uint64_t)(uintptr_t)request->local_address, request->length);
+        if (!peer || !peer->connected || !rm || !lb) {
+            bs->status[i].state = R101_FAILED;
+            bs->status[i].error = R101_INVALID_STATE;
+            continue;
+        }
+
+        struct ibv_sge sge;
+        memset(&sge, 0, sizeof(sge));
+        sge.addr = (uint64_t)(uintptr_t)request->local_address;
+        sge.length = request->length;
+        sge.lkey = lb->mr->lkey;
+
+        struct ibv_send_wr wr;
+        memset(&wr, 0, sizeof(wr));
+        wr.wr_id = ((uint64_t)bs->id << 32) | (i & 0xffffffffu);
+        wr.opcode = IBV_WR_RDMA_WRITE;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+        wr.send_flags = IBV_SEND_SIGNALED;
+        wr.wr.rdma.remote_addr = request->args.rma.remote_address;
+        wr.wr.rdma.rkey = rm->rkey;
+
+        struct ibv_send_wr *bad = NULL;
+        if (ibv_post_send(peer->qp, &wr, &bad) != 0) {
+            bs->status[i].state = R101_FAILED;
+            bs->status[i].error = R101_IO_ERROR;
+        }
+    }
+}
+
+static void *poll_worker(void *arg) {
+    r101_engine *engine = arg;
+    const struct timespec delay = {.tv_sec = 0, .tv_nsec = 100000};
+    for (;;) {
+        pthread_mutex_lock(&engine->lock);
+        if (engine->stop) {
+            pthread_mutex_unlock(&engine->lock);
+            break;
+        }
+        while (engine->pending_head) {
+            pending_batch *pending = engine->pending_head;
+            engine->pending_head = pending->next;
+            if (!engine->pending_head)
+                engine->pending_tail = NULL;
+            post_batch(engine, pending);
+            free(pending->requests);
+            free(pending);
+        }
+        struct ibv_wc wc[16];
+        int n = ibv_poll_cq(engine->cq, 16, wc);
+        for (int i = 0; i < n; ++i)
+            record_completion(engine, &wc[i]);
+        pthread_mutex_unlock(&engine->lock);
+        if (n <= 0)
+            nanosleep(&delay, NULL);
+    }
+    return NULL;
 }
 
 r101_result open_device(const char *name, struct ibv_context **ctx_out) {
@@ -228,6 +330,22 @@ r101_result r101_create_engine(const r101_config *config, r101_engine **engine) 
     e->active_mtu = port_attr.active_mtu;
     e->lid = port_attr.lid;
 
+    if (pthread_mutex_init(&e->lock, NULL) != 0) {
+        ibv_destroy_cq(e->cq);
+        ibv_dealloc_pd(e->pd);
+        ibv_close_device(e->context);
+        free(e);
+        return R101_NO_MEMORY;
+    }
+    if (pthread_create(&e->worker, NULL, poll_worker, e) != 0) {
+        pthread_mutex_destroy(&e->lock);
+        ibv_destroy_cq(e->cq);
+        ibv_dealloc_pd(e->pd);
+        ibv_close_device(e->context);
+        free(e);
+        return R101_NO_MEMORY;
+    }
+
     *engine = e;
     return R101_OK;
 }
@@ -235,6 +353,12 @@ r101_result r101_create_engine(const r101_config *config, r101_engine **engine) 
 r101_result r101_destroy_engine(r101_engine *engine) {
     if (!engine)
         return R101_INVALID;
+
+    pthread_mutex_lock(&engine->lock);
+    engine->stop = 1;
+    pthread_mutex_unlock(&engine->lock);
+    pthread_join(engine->worker, NULL);
+    pthread_mutex_destroy(&engine->lock);
 
     r101_peer *pm, *tmp1;
     HASH_ITER(hh, engine->peers, pm, tmp1) {
@@ -255,6 +379,23 @@ r101_result r101_destroy_engine(r101_engine *engine) {
         free(lbm);
     }
 
+    pending_batch *pending = engine->pending_head;
+    while (pending) {
+        pending_batch *next = pending->next;
+        free(pending->requests);
+        free(pending);
+        pending = next;
+    }
+    engine->pending_head = NULL;
+    engine->pending_tail = NULL;
+
+    batch_result *bs, *tmp4;
+    HASH_ITER(hh, engine->batch_results, bs, tmp4) {
+        HASH_DEL(engine->batch_results, bs);
+        free(bs->status);
+        free(bs);
+    }
+
     if (engine->cq != NULL) {
         ibv_destroy_cq(engine->cq);
         engine->cq = NULL;
@@ -270,6 +411,7 @@ r101_result r101_destroy_engine(r101_engine *engine) {
         engine->context = NULL;
     }
 
+    free(engine);
     return R101_OK;
 }
 
@@ -591,85 +733,40 @@ r101_result r101_submit_transfer(r101_engine *engine,
     /* Submit requests as a new batch for background execution and return its nonzero handle.
      * Copy the descriptors and accept the whole batch or none; buffers remain application-owned. */
     batch_result *bs = calloc(1, sizeof(*bs));
-    if (!bs) {
+    pending_batch *pending = calloc(1, sizeof(*pending));
+    if (!bs || !pending) {
+        free(bs);
+        free(pending);
         return R101_NO_MEMORY;
     }
-    bs->id = ++engine->batch_max_id;
     bs->count = (uint32_t)count;
     bs->status = calloc(count, sizeof(*bs->status));
-    if (!bs->status) {
+    pending->count = (uint32_t)count;
+    pending->requests = calloc(count, sizeof(*pending->requests));
+    if (!bs->status || !pending->requests) {
+        free(bs->status);
+        free(pending->requests);
         free(bs);
+        free(pending);
         return R101_NO_MEMORY;
     }
-
-    uint64_t posted = 0;
+    memcpy(pending->requests, requests, count * sizeof(*requests));
+    pending->batch = bs;
     for (uint64_t i = 0; i < count; ++i) {
-        const r101_request *request = &requests[i];
-        switch (request->opcode) {
-        case R101_WRITE: {
-            if (request->length == 0) {
-                bs->status[i].state = R101_COMPLETED;
-                break;
-            }
-            r101_peer *peer = find_peer(engine, request->peer);
-            r101_remote_memory *rm =
-                find_remote_memory(peer, request->args.rma.remote_address, request->length);
-            r101_local_buffer *lb = find_local_buffer(
-                engine, (uint64_t)(uintptr_t)request->local_address, request->length);
-
-            struct ibv_sge sge;
-            memset(&sge, 0, sizeof(sge));
-            sge.addr = (uint64_t)(uintptr_t)request->local_address;
-            sge.length = request->length;
-            sge.lkey = lb->mr->lkey;
-
-            struct ibv_send_wr wr;
-            memset(&wr, 0, sizeof(wr));
-            wr.wr_id = ((uint64_t)bs->id << 32) | (i & 0xffffffffu);
-            wr.opcode = IBV_WR_RDMA_WRITE;
-            wr.sg_list = &sge;
-            wr.num_sge = 1;
-            wr.send_flags = IBV_SEND_SIGNALED;
-            wr.wr.rdma.remote_addr = request->args.rma.remote_address;
-            wr.wr.rdma.rkey = rm->rkey;
-
-            struct ibv_send_wr *bad = NULL;
-            if (ibv_post_send(peer->qp, &wr, &bad) == 0)
-                posted++;
-            break;
-        }
-        default:
-            break;
-        }
+        if (pending->requests[i].length == 0)
+            bs->status[i].state = R101_COMPLETED;
     }
 
-    while (posted > 0) {
-        struct ibv_wc wc;
-        int n = ibv_poll_cq(engine->cq, 1, &wc);
-        if (n < 0)
-            break;
-        if (n == 0)
-            continue;
-        if ((uint32_t)(wc.wr_id >> 32) == bs->id && (wc.wr_id & 0xffffffffu) < count) {
-            uint64_t index = wc.wr_id & 0xffffffffu;
-            if (wc.status == IBV_WC_SUCCESS) {
-                bs->status[index].state = R101_COMPLETED;
-            } else {
-                bs->status[index].state = R101_FAILED;
-                bs->status[index].error = R101_IO_ERROR;
-            }
-            posted--;
-        }
-    }
-
-    for (uint64_t i = 0; i < count; ++i) {
-        if (bs->status[i].state == R101_PENDING) {
-            bs->status[i].state = R101_FAILED;
-            bs->status[i].error = R101_IO_ERROR;
-        }
-    }
-
+    pthread_mutex_lock(&engine->lock);
+    bs->id = ++engine->batch_max_id;
     HASH_ADD_INT(engine->batch_results, id, bs);
+    if (engine->pending_tail)
+        engine->pending_tail->next = pending;
+    else
+        engine->pending_head = pending;
+    engine->pending_tail = pending;
+    pthread_mutex_unlock(&engine->lock);
+
     *batch = bs->id;
     return R101_OK;
 }
@@ -685,16 +782,15 @@ r101_result r101_get_transfer_statuses(r101_engine *engine,
      * The output count must equal the batch size; failure leaves outputs unchanged. */
     uint32_t id = batch;
     batch_result *bs;
+    pthread_mutex_lock(&engine->lock);
     HASH_FIND_INT(engine->batch_results, &id, bs);
-    if (!bs) {
-        return R101_INVALID;
-    }
-
-    if (count != bs->count) {
+    if (!bs || count != bs->count) {
+        pthread_mutex_unlock(&engine->lock);
         return R101_INVALID;
     }
 
     memcpy(statuses, bs->status, count * sizeof(r101_transfer_status));
+    pthread_mutex_unlock(&engine->lock);
 
     return R101_OK;
 }
@@ -706,13 +802,22 @@ r101_result r101_free_batch(r101_engine *engine, r101_batch_handle batch) {
 
     uint32_t id = batch;
     batch_result *bs;
+    pthread_mutex_lock(&engine->lock);
     HASH_FIND_INT(engine->batch_results, &id, bs);
     if (!bs) {
+        pthread_mutex_unlock(&engine->lock);
         return R101_INVALID;
     }
+    for (uint64_t i = 0; i < bs->count; ++i) {
+        if (bs->status[i].state == R101_PENDING) {
+            pthread_mutex_unlock(&engine->lock);
+            return R101_BUSY;
+        }
+    }
 
-    free(bs->status);
     HASH_DEL(engine->batch_results, bs);
+    pthread_mutex_unlock(&engine->lock);
+    free(bs->status);
     free(bs);
 
     return R101_OK;
