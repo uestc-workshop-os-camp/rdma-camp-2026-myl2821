@@ -13,11 +13,13 @@
 #define R101_QP_SEND_WRS 16u
 #define R101_QP_RECV_WRS 16u
 #define R101_MAX_CHAIN_WRS R101_QP_SEND_WRS
+#define R101_ATOMIC_SIZE 8u
 
 typedef struct r101_memory_exchange {
     uint64_t address;
     uint64_t length;
     uint32_t rkey;
+    uint32_t access;
 } r101_memory_exchange;
 
 typedef struct r101_local_buffer {
@@ -40,6 +42,7 @@ typedef struct r101_remote_memory {
     uint64_t address;
     uint64_t length;
     uint32_t rkey;
+    uint32_t access;
     UT_hash_handle hh; /* makes this structure hashable */
 } r101_remote_memory;
 
@@ -189,15 +192,9 @@ validate_submission(r101_engine *engine, const r101_request *requests, uint64_t 
             return R101_INVALID;
         if (request->opcode != R101_WRITE && request->opcode != R101_SEND &&
             request->opcode != R101_RECV && request->opcode != R101_WRITE_IMM &&
-            request->opcode != R101_READ) {
-            switch (request->opcode) {
-            case R101_COMPARE_SWAP:
-            case R101_FETCH_ADD:
-                return R101_UNSUPPORTED;
-            default:
-                return R101_INVALID;
-            }
-        }
+            request->opcode != R101_READ && request->opcode != R101_COMPARE_SWAP &&
+            request->opcode != R101_FETCH_ADD)
+            return R101_INVALID;
         r101_peer *peer = find_peer(engine, request->peer);
         if (!peer)
             return R101_INVALID;
@@ -205,6 +202,20 @@ validate_submission(r101_engine *engine, const r101_request *requests, uint64_t 
             return R101_INVALID_STATE;
         if ((request->flags & R101_INLINE) && request->length > peer->inline_limit)
             return R101_UNSUPPORTED;
+        if (request->opcode == R101_COMPARE_SWAP || request->opcode == R101_FETCH_ADD) {
+            uint64_t remote = request->args.atomic.remote_address;
+            uintptr_t local = (uintptr_t)request->local_address;
+            if (request->length != R101_ATOMIC_SIZE || (local & (R101_ATOMIC_SIZE - 1)) != 0 ||
+                (remote & (R101_ATOMIC_SIZE - 1)) != 0)
+                return R101_INVALID;
+            r101_local_buffer *lb = find_local_buffer(engine, (uint64_t)local, R101_ATOMIC_SIZE);
+            if (!lb || !(lb->access & R101_LOCAL_WRITE))
+                return R101_INVALID;
+            r101_remote_memory *rm = find_remote_memory(peer, remote, R101_ATOMIC_SIZE);
+            if (!rm || !(rm->access & R101_REMOTE_ATOMIC))
+                return R101_INVALID;
+            continue;
+        }
         if (request->length == 0)
             continue;
         int local_required = !(request->flags & R101_INLINE);
@@ -238,6 +249,8 @@ static uint64_t request_slices_count(const r101_request *request) {
         return request->length == 0 ? 1 : (request->length + R101_SLICE_SIZE - 1) / R101_SLICE_SIZE;
     case R101_SEND:
     case R101_RECV:
+    case R101_COMPARE_SWAP:
+    case R101_FETCH_ADD:
         return 1;
     default:
         return 0;
@@ -447,6 +460,35 @@ static uint32_t append_rma_wrs(struct ibv_send_wr *wrs,
     return built;
 }
 
+static uint32_t append_atomic_wr(struct ibv_send_wr *wrs,
+                                 struct ibv_sge *sges,
+                                 uint32_t built,
+                                 uint32_t index,
+                                 const r101_request *request,
+                                 uint32_t lkey,
+                                 uint32_t rkey,
+                                 posted_chain *chain) {
+    struct ibv_send_wr *wr = &wrs[built];
+    memset(wr, 0, sizeof(*wr));
+    int compare_swap = request->opcode == R101_COMPARE_SWAP;
+    wr->opcode = compare_swap ? IBV_WR_ATOMIC_CMP_AND_SWP : IBV_WR_ATOMIC_FETCH_AND_ADD;
+    wr->wr.atomic.remote_addr = request->args.atomic.remote_address;
+    wr->wr.atomic.rkey = rkey;
+    wr->wr.atomic.compare_add =
+        compare_swap ? request->args.atomic.compare : request->args.atomic.value;
+    if (compare_swap)
+        wr->wr.atomic.swap = request->args.atomic.value;
+    struct ibv_sge *sge = &sges[(size_t)built * R101_SGES_PER_WR];
+    sge->addr = (uint64_t)(uintptr_t)request->local_address;
+    sge->length = R101_ATOMIC_SIZE;
+    sge->lkey = lkey;
+    wr->sg_list = sge;
+    wr->num_sge = 1;
+    chain->wrs[built].index = index;
+    chain->wrs[built].sges = 1;
+    return built + 1;
+}
+
 static uint32_t ensure_slices(struct ibv_send_wr *wrs,
                               struct ibv_sge *sges,
                               uint32_t built,
@@ -463,6 +505,13 @@ static uint32_t ensure_slices(struct ibv_send_wr *wrs,
         if (*next_slice > 0)
             return built;
         built = append_send_wr(wrs, sges, built, index, request, lkey, chain);
+        *next_slice = 1;
+        return built;
+    }
+    if (request->opcode == R101_COMPARE_SWAP || request->opcode == R101_FETCH_ADD) {
+        if (*next_slice > 0)
+            return built;
+        built = append_atomic_wr(wrs, sges, built, index, request, lkey, rkey, chain);
         *next_slice = 1;
         return built;
     }
@@ -624,6 +673,14 @@ static int lookup_request(r101_engine *engine,
         if (!lb)
             return 0;
         *lkey = lb->mr->lkey;
+    }
+    if (request->opcode == R101_COMPARE_SWAP || request->opcode == R101_FETCH_ADD) {
+        r101_remote_memory *rm =
+            find_remote_memory(peer, request->args.atomic.remote_address, request->length);
+        if (!rm)
+            return 0;
+        *rkey = rm->rkey;
+        return 1;
     }
     if (request->length > 0 &&
         (request->opcode == R101_WRITE || request->opcode == R101_WRITE_IMM ||
@@ -1003,7 +1060,8 @@ r101_result r101_register_local_memory(r101_engine *engine,
     *metadata_size = 0;
     const r101_access_flags known =
         R101_LOCAL_WRITE | R101_REMOTE_WRITE | R101_REMOTE_READ | R101_REMOTE_ATOMIC;
-    if (!engine || !valid_array(address, length, 1, 1) || (access & ~known))
+    if (!engine || !valid_array(address, length, 1, 1) || (access & ~known) ||
+        ((access & R101_REMOTE_ATOMIC) && !(access & R101_LOCAL_WRITE)))
         return R101_INVALID;
     /* Register application memory and export its handle and stable metadata. */
 
@@ -1020,6 +1078,7 @@ r101_result r101_register_local_memory(r101_engine *engine,
     lbm->exported.address = (uint64_t)(uintptr_t)address;
     lbm->exported.length = length;
     lbm->exported.rkey = lbm->mr->rkey;
+    lbm->exported.access = access;
 
     pthread_mutex_lock(&engine->lock);
     uint64_t id = ++engine->buffer_max_id;
@@ -1108,6 +1167,7 @@ r101_result r101_import_remote_memory(r101_engine *engine,
     entry->address = info->address;
     entry->length = info->length;
     entry->rkey = info->rkey;
+    entry->access = info->access;
     uint32_t handle = ++engine->remote_mem_max_id;
     entry->id = handle;
     HASH_ADD_INT(pm->remote_mems, id, entry);
@@ -1185,8 +1245,8 @@ r101_result r101_create_peer(r101_engine *engine,
     attr.qp_state = IBV_QPS_INIT;
     attr.pkey_index = 0;
     attr.port_num = engine->port;
-    attr.qp_access_flags =
-        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
+    attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+                           IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC;
 
     int flags = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS;
     if (ibv_modify_qp(pm->qp, &attr, flags) != 0) {
