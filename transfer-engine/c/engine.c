@@ -109,9 +109,8 @@ find_local_buffer(r101_engine *engine, uint64_t address, uint64_t length) {
     return NULL;
 }
 
-static r101_result validate_submission(r101_engine *engine,
-                                       const r101_request *requests,
-                                       uint64_t count) {
+static r101_result
+validate_submission(r101_engine *engine, const r101_request *requests, uint64_t count) {
     for (uint64_t i = 0; i < count; ++i) {
         const r101_request *request = &requests[i];
         if (request->flags != 0 && request->flags != R101_INLINE)
@@ -142,8 +141,8 @@ static r101_result validate_submission(r101_engine *engine,
         if (request->flags == R101_INLINE)
             return R101_UNSUPPORTED;
         if (!find_remote_memory(peer, request->args.rma.remote_address, request->length) ||
-            !find_local_buffer(engine, (uint64_t)(uintptr_t)request->local_address,
-                               request->length))
+            !find_local_buffer(
+                engine, (uint64_t)(uintptr_t)request->local_address, request->length))
             return R101_INVALID;
     }
     return R101_OK;
