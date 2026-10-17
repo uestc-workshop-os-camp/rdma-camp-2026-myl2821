@@ -185,11 +185,14 @@ static r101_result
 validate_submission(r101_engine *engine, const r101_request *requests, uint64_t count) {
     for (uint64_t i = 0; i < count; ++i) {
         const r101_request *request = &requests[i];
+        // only inline flag is supported
         if (request->flags != 0 && request->flags != R101_INLINE)
             return R101_INVALID;
+        // inline operation should be bind to WRITE/SEND
         if (request->flags == R101_INLINE && request->opcode != R101_WRITE &&
             request->opcode != R101_SEND && request->opcode != R101_WRITE_IMM)
             return R101_INVALID;
+        // only 7 kinds of op supported
         if (request->opcode != R101_WRITE && request->opcode != R101_SEND &&
             request->opcode != R101_RECV && request->opcode != R101_WRITE_IMM &&
             request->opcode != R101_READ && request->opcode != R101_COMPARE_SWAP &&
@@ -198,10 +201,13 @@ validate_submission(r101_engine *engine, const r101_request *requests, uint64_t 
         r101_peer *peer = find_peer(engine, request->peer);
         if (!peer)
             return R101_INVALID;
+        // only RECV can be posted before connected
         if (request->opcode != R101_RECV && !peer->connected)
             return R101_INVALID_STATE;
+        // check payload size for inline message
         if ((request->flags & R101_INLINE) && request->length > peer->inline_limit)
             return R101_UNSUPPORTED;
+        // check atomic ops
         if (request->opcode == R101_COMPARE_SWAP || request->opcode == R101_FETCH_ADD) {
             uint64_t remote = request->args.atomic.remote_address;
             uintptr_t local = (uintptr_t)request->local_address;
@@ -218,6 +224,7 @@ validate_submission(r101_engine *engine, const r101_request *requests, uint64_t 
         }
         if (request->length == 0)
             continue;
+        // check if memory is valid
         int local_required = !(request->flags & R101_INLINE);
         if (local_required) {
             r101_local_buffer *lb = find_local_buffer(
@@ -659,34 +666,47 @@ static int position_pending(r101_engine *engine, pending_batch *pending) {
     return pending->index < pending->count;
 }
 
-static int lookup_request(r101_engine *engine,
-                          r101_peer *peer,
-                          const r101_request *request,
-                          uint32_t *lkey,
-                          uint32_t *rkey) {
+static int lookup_key_for_request(r101_engine *engine,
+                                  r101_peer *peer,
+                                  const r101_request *request,
+                                  uint32_t *lkey,
+                                  uint32_t *rkey) {
     *lkey = 0;
     *rkey = 0;
+    uint64_t local = (uint64_t)(uintptr_t)request->local_address;
+    uint64_t remote = 0;
     int inline_source = (request->flags & R101_INLINE) != 0;
+    switch (request->opcode) {
+    case R101_SEND:
+    case R101_RECV:
+        if (request->length > 0 && !inline_source) {
+            r101_local_buffer *lb = find_local_buffer(engine, local, request->length);
+            if (!lb)
+                return 0;
+            *lkey = lb->mr->lkey;
+        }
+        return 1;
+    case R101_WRITE:
+    case R101_READ:
+        remote = request->args.rma.remote_address;
+        break;
+    case R101_WRITE_IMM:
+        remote = request->args.write_imm.remote_address;
+        break;
+    case R101_COMPARE_SWAP:
+    case R101_FETCH_ADD:
+        remote = request->args.atomic.remote_address;
+        break;
+    default:
+        return 0;
+    }
     if (request->length > 0 && !inline_source) {
-        r101_local_buffer *lb =
-            find_local_buffer(engine, (uint64_t)(uintptr_t)request->local_address, request->length);
+        r101_local_buffer *lb = find_local_buffer(engine, local, request->length);
         if (!lb)
             return 0;
         *lkey = lb->mr->lkey;
     }
-    if (request->opcode == R101_COMPARE_SWAP || request->opcode == R101_FETCH_ADD) {
-        r101_remote_memory *rm =
-            find_remote_memory(peer, request->args.atomic.remote_address, request->length);
-        if (!rm)
-            return 0;
-        *rkey = rm->rkey;
-        return 1;
-    }
-    if (request->length > 0 &&
-        (request->opcode == R101_WRITE || request->opcode == R101_WRITE_IMM ||
-         request->opcode == R101_READ)) {
-        uint64_t remote = request->opcode == R101_WRITE ? request->args.rma.remote_address
-                                                        : request->args.write_imm.remote_address;
+    if (request->length > 0) {
         r101_remote_memory *rm = find_remote_memory(peer, remote, request->length);
         if (!rm)
             return 0;
@@ -724,7 +744,7 @@ static uint32_t build_chain(r101_engine *engine,
 
         uint32_t lkey = 0;
         uint32_t rkey = 0;
-        if (!lookup_request(engine, peer, request, &lkey, &rkey)) {
+        if (!lookup_key_for_request(engine, peer, request, &lkey, &rkey)) {
             pending->batch->remaining[*index] -= total - *next_slice;
             fail_task(pending->batch, *index, R101_INVALID_STATE);
             ++*index;
