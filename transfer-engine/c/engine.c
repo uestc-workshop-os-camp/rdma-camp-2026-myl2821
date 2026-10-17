@@ -42,22 +42,35 @@ typedef struct r101_peer {
     UT_hash_handle hh;               /* makes this structure hashable */
 } r101_peer;
 
+typedef struct batch_result {
+    uint32_t id;
+    uint32_t count;
+    r101_transfer_status *status;
+    UT_hash_handle hh; /* makes this structure hashable */
+} batch_result;
+
 /* Define struct r101_engine here to hold device resources, peers, MRs and tasks. */
 typedef struct r101_engine {
     uint32_t port;
     uint32_t gid_index;
     enum ibv_mtu active_mtu;
     uint16_t lid;
+
     struct ibv_context *context;
     struct ibv_pd *pd;
     struct ibv_cq *cq;
+
     r101_local_buffer *lbs;
     uint32_t buffer_count;
     uint32_t buffer_max_id;
+
     r101_peer *peers;
     uint32_t peer_count;
     uint32_t peer_max_id;
+
     uint32_t remote_mem_max_id;
+
+    batch_result *batch_results;
     uint32_t batch_max_id;
 } r101_engine;
 
@@ -130,6 +143,7 @@ r101_result r101_create_engine(const r101_config *config, r101_engine **engine) 
     e->buffer_count = 0;
     e->buffer_max_id = 0;
     e->peer_max_id = 0;
+    e->batch_max_id = 0;
 
     int rc = open_device(config->device, &(e->context));
     if (rc != R101_OK) {
@@ -570,17 +584,6 @@ r101_result r101_submit_transfer(r101_engine *engine,
                 return R101_IO_ERROR;
             }
 
-            for (;;) {
-                struct ibv_wc wc;
-                int n = ibv_poll_cq(engine->cq, 1, &wc);
-                if (n < 0)
-                    return R101_IO_ERROR;
-                if (n == 0)
-                    continue;
-                printf("%d\n", wc.status);
-                break;
-            }
-
         case R101_READ:
         case R101_SEND:
         case R101_RECV:
@@ -592,9 +595,44 @@ r101_result r101_submit_transfer(r101_engine *engine,
             return R101_INVALID;
         }
     }
+
     /* Submit requests as a new batch for background execution and return its nonzero handle.
      * Copy the descriptors and accept the whole batch or none; buffers remain application-owned. */
-    *batch = ++engine->batch_max_id;
+    batch_result *bs = calloc(1, sizeof(*bs));
+    if (!bs) {
+        return R101_NO_MEMORY;
+    }
+    bs->id = ++engine->batch_max_id;
+    bs->status = calloc(count, sizeof(r101_transfer_status));
+    bs->count = count;
+    for (int i = 0; i < count; i++) {
+        bs->status[i].state = R101_PENDING;
+    }
+
+    for (int i = 0; i < count;) {
+        for (;;) {
+            struct ibv_wc wc;
+            int n = ibv_poll_cq(engine->cq, 1, &wc);
+            if (n < 0)
+                return R101_IO_ERROR;
+            if (n == 0)
+                continue;
+            if (wc.status == IBV_WC_SUCCESS) {
+                for (int j = i; j < i + n; j++) {
+                    bs->status[j].state = R101_COMPLETED;
+                }
+            } else {
+                for (int j = i; j < i + n; j++) {
+                    bs->status[j].state = R101_FAILED;
+                }
+            }
+            i += n;
+            break;
+        }
+    }
+    *batch = bs->id;
+
+    HASH_ADD_INT(engine->batch_results, id, bs);
     return R101_OK;
 }
 
@@ -607,12 +645,39 @@ r101_result r101_get_transfer_statuses(r101_engine *engine,
         return R101_INVALID;
     /* Read every task's current status in submission order without advancing transfers.
      * The output count must equal the batch size; failure leaves outputs unchanged. */
-    return R101_UNIMPLEMENTED;
+    uint32_t id = batch;
+    batch_result *bs;
+    HASH_FIND_INT(engine->batch_results, &id, bs);
+    if (!bs) {
+        return R101_INVALID;
+    }
+
+    printf("%d, %d", count, bs->count);
+
+    if (count != bs->count) {
+        return R101_INVALID;
+    }
+
+    memcpy(statuses, bs->status, count * sizeof(r101_transfer_status));
+
+    return R101_OK;
 }
 
 r101_result r101_free_batch(r101_engine *engine, r101_batch_handle batch) {
     if (!engine || !batch)
         return R101_INVALID;
     /* Free terminal task records; return BUSY while any task remains pending. */
-    return R101_UNIMPLEMENTED;
+
+    uint32_t id = batch;
+    batch_result *bs;
+    HASH_FIND_INT(engine->batch_results, &id, bs);
+    if (!bs) {
+        return R101_INVALID;
+    }
+
+    free(bs->status);
+    HASH_DEL(engine->batch_results, bs);
+    free(bs);
+
+    return R101_OK;
 }
